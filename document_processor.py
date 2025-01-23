@@ -9,6 +9,11 @@ import os
 from typing import Optional, Dict, List, Union
 from config import get_chroma_client, get_or_create_collection
 from tqdm import tqdm
+from pdfminer.high_level import extract_text
+from pdfplumber import open as pdfplumber_open
+from PyPDF2 import PdfReader
+from pytesseract import image_to_string
+from pdf2image import convert_from_path
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -81,37 +86,95 @@ class DocumentProcessor:
         self.processed_files[str(file_path)] = self.get_file_hash(file_path)
         self.save_processed_files()
 
+    def extract_pdf_text(self, file_path: Path) -> str:
+        """Enhanced PDF text extraction with multiple methods and OCR fallback"""
+        try:
+            # Try multiple extraction methods
+            methods = {}
+            
+            try:
+                methods['pdfminer'] = extract_text(file_path)
+            except Exception as e:
+                logger.warning(f"pdfminer extraction failed: {str(e)}")
+                methods['pdfminer'] = ""
+                
+            try:
+                with pdfplumber_open(file_path) as pdf:
+                    methods['pdfplumber'] = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            except Exception as e:
+                logger.warning(f"pdfplumber extraction failed: {str(e)}")
+                methods['pdfplumber'] = ""
+                
+            try:
+                reader = PdfReader(file_path)
+                methods['PyPDF2'] = "\n".join(page.extract_text() or "" for page in reader.pages)
+            except Exception as e:
+                logger.warning(f"PyPDF2 extraction failed: {str(e)}")
+                methods['PyPDF2'] = ""
+                
+            # Choose the method with most content
+            best_text = max(methods.values(), key=len)
+            
+            if not best_text.strip():
+                logger.info("No text extracted. Attempting OCR...")
+                try:
+                    images = convert_from_path(file_path)
+                    best_text = "\n".join(image_to_string(img) for img in images)
+                    
+                    if not best_text.strip():
+                        logger.warning("OCR failed to extract text")
+                        return ""
+                except Exception as e:
+                    logger.error(f"OCR failed: {str(e)}")
+                    return ""
+                
+            return best_text
+            
+        except Exception as e:
+            logger.error(f"Error extracting text from {file_path}: {e}")
+            return ""
+
     def process_pdf(self, file_path: Path) -> bool:
-        """Process a PDF file with progress tracking"""
+        """Process a PDF file with enhanced text extraction and embedding"""
         try:
             if not self.should_process_file(file_path):
                 logger.info(f"Skipping unchanged file: {file_path}")
                 return False
 
             logger.info(f"Processing PDF: {file_path}")
-            loader = PyPDFLoader(str(file_path))
-            pages = loader.load()
             
-            # Show progress bar for chunking
+            # Extract text using enhanced method
+            extracted_text = self.extract_pdf_text(file_path)
+            
+            if not extracted_text:
+                logger.error(f"No text could be extracted from {file_path}")
+                return False
+                
+            # Split text into pages (approximate)
+            pages = extracted_text.split('\f') if '\f' in extracted_text else [extracted_text]
+            
+            # Create chunks with metadata
             chunks = []
-            for page in tqdm(pages, desc="Splitting pages"):
-                page_chunks = self.text_splitter.split_documents([page])
-                chunks.extend(page_chunks)
+            for page_num, page_text in enumerate(pages):
+                page_chunks = self.text_splitter.split_text(page_text)
+                chunks.extend([{
+                    "page_content": chunk,
+                    "metadata": {
+                        "source": str(file_path),
+                        "page": page_num + 1,
+                        "type": "pdf",
+                        "total_pages": len(pages)
+                    }
+                } for chunk in page_chunks])
             
             # Delete existing chunks for this file
             self.delete_file_chunks(str(file_path))
             
-            texts = [chunk.page_content for chunk in chunks]
-            metadatas = [{
-                "source": str(file_path),
-                "page": chunk.metadata.get("page", 0),
-                "type": "pdf",
-                "chunk_number": i,
-                "total_chunks": len(chunks)
-            } for i, chunk in enumerate(chunks)]
-            
+            # Prepare data for storage
+            texts = [chunk["page_content"] for chunk in chunks]
+            metadatas = [chunk["metadata"] for chunk in chunks]
             ids = [f"pdf_{file_path.stem}_{i}" for i in range(len(chunks))]
-
+            
             if texts:
                 # Process in batches with progress bar
                 batch_size = 100

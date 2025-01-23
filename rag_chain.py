@@ -1,3 +1,18 @@
+"""
+RAG Chain Module for Loan Processing
+
+This module implements a Retrieval-Augmented Generation (RAG) system for loan document analysis.
+It combines document retrieval with language model generation to provide accurate,
+context-aware responses to loan-related queries.
+
+Key Features:
+- Multi-LLM support (DeepSeek, GPT, Claude)
+- Automatic fallback mechanisms
+- Context-aware responses
+- Error handling with retries
+- Structured response formatting
+"""
+
 from typing import List, Dict, Optional, Generator, AsyncGenerator
 import logging
 from langchain.llms.base import BaseLLM
@@ -17,21 +32,45 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class LoanAssistant:
+    """
+    A class implementing RAG-based loan document analysis and question answering.
+    
+    This class combines vector search over processed documents with language model
+    generation to provide intelligent responses to loan-related queries.
+    
+    Key Components:
+    - Document retrieval from ChromaDB
+    - LLM-based answer generation
+    - Error handling and fallback mechanisms
+    - Context-aware response formatting
+    """
+
     def __init__(self, model_name: str = "deepseek-chat"):
+        """
+        Initialize the LoanAssistant with specified LLM and components.
+        
+        Args:
+            model_name: Name of the LLM to use (deepseek-chat, gpt-4, claude, etc.)
+            
+        The initialization process:
+        1. Sets up document processor and vector store
+        2. Initializes the specified language model
+        3. Configures system prompts and fallback responses
+        """
         # Load environment variables
         load_dotenv()
         
-        # Initialize components
+        # Initialize core components
         self.doc_processor = DocumentProcessor()
         self.client = get_chroma_client()
         self.collection = get_or_create_collection(self.client)
         
-        # Initialize LLM based on model name
+        # Setup LLM
         self.model_name = model_name
         self.llm = self._initialize_llm(model_name)
         logger.info(f"✓ LLM initialized: {model_name}")
 
-        # Define prompts
+        # Configure system prompts for different scenarios
         self.system_prompt = """You are a loan document analysis assistant. Provide clear, concise answers based on the provided context.
         Keep responses focused and brief, highlighting only the most relevant information.
         If you can't find a specific answer in the context, provide a general, accurate response based on your knowledge,
@@ -44,7 +83,7 @@ class LoanAssistant:
         4. Stick to factual, practical information
         5. Keep responses brief and to the point"""
 
-        # Backup response for connection issues
+        # Configure backup response for system failures
         self.backup_response = """Based on general lending practices (system is experiencing connection issues, providing backup response):
 
 Typical loan requirements usually include:
@@ -63,7 +102,22 @@ Note: Specific requirements vary by lender and loan type. Please check with your
         reraise=True
     )
     def _initialize_llm(self, model_name: str) -> BaseLLM:
-        """Initialize the appropriate LLM based on model name with retry logic"""
+        """
+        Initialize the specified language model with retry logic.
+        
+        Args:
+            model_name: Name of the LLM to initialize
+            
+        Returns:
+            Initialized LLM instance
+            
+        Raises:
+            ValueError: If model_name is not supported
+            Exception: If initialization fails after retries
+            
+        The method supports multiple LLM providers and includes
+        automatic retries with exponential backoff.
+        """
         try:
             if model_name == "deepseek-chat":
                 return ChatOpenAI(
@@ -100,7 +154,18 @@ Note: Specific requirements vary by lender and loan type. Please check with your
         wait=wait_exponential(multiplier=1, min=4, max=10)
     )
     async def _get_llm_response(self, messages: List[Dict[str, str]]) -> str:
-        """Get LLM response with retry logic"""
+        """
+        Get response from LLM with retry logic.
+        
+        Args:
+            messages: List of message dictionaries (role and content)
+            
+        Returns:
+            Generated response text
+            
+        Raises:
+            Exception: If LLM generation fails after retries
+        """
         try:
             response = await self.llm.ainvoke(messages)
             return response.content
@@ -109,7 +174,18 @@ Note: Specific requirements vary by lender and loan type. Please check with your
             raise
 
     async def get_general_answer(self, question: str) -> str:
-        """Get a general answer when no relevant documents are found"""
+        """
+        Generate a general answer when no relevant documents are found.
+        
+        Args:
+            question: User's question
+            
+        Returns:
+            Generated response or backup response on failure
+            
+        This method uses the general system prompt to provide
+        responses based on the LLM's base knowledge.
+        """
         try:
             messages = [
                 {"role": "system", "content": self.general_system_prompt},
@@ -131,16 +207,34 @@ Keep the response concise and focused."""}
         question: str,
         streaming: bool = True
     ) -> Dict:
-        """Answer a question using RAG with formatted response"""
+        """
+        Answer a question using RAG with formatted response.
+        
+        Args:
+            question: User's question
+            streaming: Whether to stream the response
+            
+        Returns:
+            Dictionary containing:
+            - answer: Generated response
+            - references: Source documents used
+            - is_general_answer: Whether response is from general knowledge
+            - is_backup_response: Whether it's a fallback response
+            
+        This method implements the core RAG pipeline:
+        1. Retrieve relevant documents
+        2. Generate response using context
+        3. Format response with references
+        """
         try:
-            # Search for relevant context
+            # Retrieve relevant documents
             results = self.collection.query(
                 query_texts=[question],
                 n_results=3
             )
             
             if not results["documents"][0]:
-                # Get general answer if no relevant documents found
+                # Fall back to general knowledge if no relevant documents
                 general_answer = await self.get_general_answer(question)
                 return {
                     "answer": general_answer,
@@ -148,7 +242,7 @@ Keep the response concise and focused."""}
                     "is_general_answer": True
                 }
             
-            # Format context and metadata
+            # Process and format retrieved documents
             contexts = []
             references = []
             
@@ -158,7 +252,7 @@ Keep the response concise and focused."""}
                 page_or_row = metadata.get("page", metadata.get("row", "Unknown"))
                 chunk_id = results["ids"][0][i]
                 
-                # Format reference
+                # Format document reference
                 ref = {
                     "source": f"[{doc_type}: {Path(source).name}]",
                     "location": f"{'Page' if doc_type == 'PDF' else 'Row'} {page_or_row}",
@@ -169,7 +263,7 @@ Keep the response concise and focused."""}
                 contexts.append(doc)
             
             try:
-                # Try to get response from LLM
+                # Generate response using retrieved context
                 context_text = "\n\n".join(contexts)
                 messages = [
                     {"role": "system", "content": self.system_prompt},
@@ -179,7 +273,7 @@ Keep the response concise and focused."""}
                 response_content = await self._get_llm_response(messages)
                 
             except Exception as e:
-                # If LLM fails, fall back to general answer
+                # Fall back to backup response on failure
                 logger.error(f"LLM response failed, using backup: {str(e)}")
                 return {
                     "answer": self.backup_response,
@@ -204,9 +298,26 @@ Keep the response concise and focused."""}
             }
 
     async def analyze_loan_application(self, application_id: str) -> Dict:
-        """Analyze a specific loan application"""
+        """
+        Perform detailed analysis of a specific loan application.
+        
+        Args:
+            application_id: Identifier for the loan application
+            
+        Returns:
+            Dictionary containing:
+            - status: Analysis status (success/error)
+            - analysis: Detailed analysis if successful
+            - documents_analyzed: Number of documents processed
+            - error: Error message if failed
+            
+        This method:
+        1. Retrieves all documents for the application
+        2. Generates comprehensive analysis
+        3. Includes multiple aspects of evaluation
+        """
         try:
-            # Get application documents
+            # Retrieve application documents
             results = self.collection.get(
                 where={"metadata.application_id": application_id}
             )
@@ -217,10 +328,10 @@ Keep the response concise and focused."""}
                     "message": f"No documents found for application {application_id}"
                 }
             
-            # Format application data
+            # Combine all application data
             application_data = "\n\n".join(results["documents"])
             
-            # Create analysis prompt
+            # Create comprehensive analysis prompt
             analysis_prompt = f"""Please analyze this loan application:
             
             {application_data}
@@ -232,7 +343,7 @@ Keep the response concise and focused."""}
             4. Recommendations"""
             
             try:
-                # Get analysis from LLM
+                # Generate analysis using LLM
                 messages = [
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": analysis_prompt}
